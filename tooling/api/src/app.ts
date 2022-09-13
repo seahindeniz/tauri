@@ -38,6 +38,10 @@ async function getVersion(): Promise<string> {
  * const appName = await getName();
  * ```
  *
+ * @history
+ * - 1.0.1: Added `getVersion` function.
+ * - 1.0.0: Added `getVersion` function.
+ *
  * @since 1.0.0
  */
 async function getName(): Promise<string> {
