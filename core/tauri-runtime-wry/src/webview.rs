@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2022 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -32,6 +32,12 @@ mod imp {
   pub struct Webview {
     pub controller: ICoreWebView2Controller,
   }
+}
+
+#[cfg(target_os = "android")]
+mod imp {
+  use wry::webview::JniHandle;
+  pub type Webview = JniHandle;
 }
 
 pub use imp::*;

@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2022 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -86,7 +86,7 @@ pub(crate) struct PatternJavascript {
 
 #[allow(dead_code)]
 pub(crate) fn format_real_schema(schema: &str) -> String {
-  if cfg!(windows) {
+  if cfg!(windows) || cfg!(target_os = "android") {
     format!("https://{}.localhost", schema)
   } else {
     format!("{}://localhost", schema)

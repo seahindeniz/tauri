@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2022 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -6,18 +6,21 @@ use crate::{
   helpers::{
     app_paths::{app_dir, tauri_dir},
     command_env,
-    config::{get as get_config, AppUrl, WindowUrl, MERGE_CONFIG_EXTENSION_NAME},
-    updater_signature::sign_file_from_env_variables,
+    config::{get as get_config, AppUrl, HookCommand, WindowUrl, MERGE_CONFIG_EXTENSION_NAME},
+    updater_signature::{read_key_from_file, secret_key as updater_secret_key, sign_file},
   },
   interface::{AppInterface, AppSettings, Interface},
   CommandExt, Result,
 };
 use anyhow::{bail, Context};
-use clap::Parser;
-use log::warn;
-use log::{error, info};
-use std::{env::set_current_dir, path::PathBuf, process::Command};
-use tauri_bundler::bundle::{bundle_project, PackageType};
+use clap::{ArgAction, Parser};
+use log::{debug, error, info, warn};
+use std::{
+  env::{set_current_dir, var_os},
+  path::{Path, PathBuf},
+  process::Command,
+};
+use tauri_bundler::bundle::{bundle_project, Bundle, PackageType};
 
 #[derive(Debug, Clone, Parser)]
 #[clap(about = "Tauri build")]
@@ -36,7 +39,7 @@ pub struct Options {
   #[clap(short, long)]
   pub target: Option<String>,
   /// Space or comma separated list of features to activate
-  #[clap(short, long, multiple_occurrences(true), multiple_values(true))]
+  #[clap(short, long, action = ArgAction::Append, num_args(0..))]
   pub features: Option<Vec<String>>,
   /// Space or comma separated list of bundles to package.
   ///
@@ -44,7 +47,7 @@ pub struct Options {
   /// If `none` is specified, the bundler will be skipped.
   ///
   /// Note that the `updater` bundle is not automatically added so you must specify it if the updater is enabled.
-  #[clap(short, long, multiple_occurrences(true), multiple_values(true))]
+  #[clap(short, long, action = ArgAction::Append, num_args(0..))]
   pub bundles: Option<Vec<String>>,
   /// JSON string or path to JSON file to merge with tauri.conf.json
   #[clap(short, long)]
@@ -54,132 +57,12 @@ pub struct Options {
 }
 
 pub fn command(mut options: Options) -> Result<()> {
-  let (merge_config, merge_config_path) = if let Some(config) = &options.config {
-    if config.starts_with('{') {
-      (Some(config.to_string()), None)
-    } else {
-      (
-        Some(
-          std::fs::read_to_string(&config)
-            .with_context(|| "failed to read custom configuration")?,
-        ),
-        Some(config.clone()),
-      )
-    }
-  } else {
-    (None, None)
-  };
-  options.config = merge_config;
-
-  let tauri_path = tauri_dir();
-  set_current_dir(&tauri_path).with_context(|| "failed to change current working directory")?;
+  let mut interface = setup(&mut options)?;
 
   let config = get_config(options.config.as_deref())?;
-
   let config_guard = config.lock().unwrap();
   let config_ = config_guard.as_ref().unwrap();
 
-  let bundle_identifier_source = match config_.find_bundle_identifier_overwriter() {
-    Some(source) if source == MERGE_CONFIG_EXTENSION_NAME => {
-      merge_config_path.unwrap_or_else(|| source.into())
-    }
-    Some(source) => source.into(),
-    None => "tauri.conf.json".into(),
-  };
-
-  if config_.tauri.bundle.identifier == "com.tauri.dev" {
-    error!(
-      "You must change the bundle identifier in `{} > tauri > bundle > identifier`. The default value `com.tauri.dev` is not allowed as it must be unique across applications.",
-      bundle_identifier_source
-    );
-    std::process::exit(1);
-  }
-
-  if config_
-    .tauri
-    .bundle
-    .identifier
-    .chars()
-    .any(|ch| !(ch.is_alphanumeric() || ch == '-' || ch == '.'))
-  {
-    error!(
-      "The bundle identifier \"{}\" set in `{} > tauri > bundle > identifier`. The bundle identifier string must contain only alphanumeric characters (A–Z, a–z, and 0–9), hyphens (-), and periods (.).",
-      config_.tauri.bundle.identifier,
-      bundle_identifier_source
-    );
-    std::process::exit(1);
-  }
-
-  if let Some(before_build) = &config_.build.before_build_command {
-    if !before_build.is_empty() {
-      info!(action = "Running"; "beforeBuildCommand `{}`", before_build);
-      #[cfg(target_os = "windows")]
-      let status = Command::new("cmd")
-        .arg("/S")
-        .arg("/C")
-        .arg(before_build)
-        .current_dir(app_dir())
-        .envs(command_env(options.debug))
-        .piped()
-        .with_context(|| format!("failed to run `{}` with `cmd /C`", before_build))?;
-      #[cfg(not(target_os = "windows"))]
-      let status = Command::new("sh")
-        .arg("-c")
-        .arg(before_build)
-        .current_dir(app_dir())
-        .envs(command_env(options.debug))
-        .piped()
-        .with_context(|| format!("failed to run `{}` with `sh -c`", before_build))?;
-
-      if !status.success() {
-        bail!(
-          "beforeBuildCommand `{}` failed with exit code {}",
-          before_build,
-          status.code().unwrap_or_default()
-        );
-      }
-    }
-  }
-
-  if let AppUrl::Url(WindowUrl::App(web_asset_path)) = &config_.build.dist_dir {
-    if !web_asset_path.exists() {
-      return Err(anyhow::anyhow!(
-          "Unable to find your web assets, did you forget to build your web app? Your distDir is set to \"{:?}\".",
-          web_asset_path
-        ));
-    }
-    if web_asset_path.canonicalize()?.file_name() == Some(std::ffi::OsStr::new("src-tauri")) {
-      return Err(anyhow::anyhow!(
-            "The configured distDir is the `src-tauri` folder.
-            Please isolate your web assets on a separate folder and update `tauri.conf.json > build > distDir`.",
-          ));
-    }
-
-    let mut out_folders = Vec::new();
-    for folder in &["node_modules", "src-tauri", "target"] {
-      if web_asset_path.join(folder).is_dir() {
-        out_folders.push(folder.to_string());
-      }
-    }
-    if !out_folders.is_empty() {
-      return Err(anyhow::anyhow!(
-            "The configured distDir includes the `{:?}` {}. Please isolate your web assets on a separate folder and update `tauri.conf.json > build > distDir`.",
-            out_folders,
-            if out_folders.len() == 1 { "folder" }else { "folders" }
-          )
-        );
-    }
-  }
-
-  if options.runner.is_none() {
-    options.runner = config_.build.runner.clone();
-  }
-
-  if let Some(list) = options.features.as_mut() {
-    list.extend(config_.build.features.clone().unwrap_or_default());
-  }
-
-  let mut interface = AppInterface::new(config_)?;
   let app_settings = interface.app_settings();
   let interface_options = options.clone().into();
 
@@ -225,6 +108,18 @@ pub fn command(mut options: Options) -> Result<()> {
     if let Some(types) = &package_types {
       if config_.tauri.updater.active && !types.contains(&PackageType::Updater) {
         warn!("The updater is enabled but the bundle target list does not contain `updater`, so the updater artifacts won't be generated.");
+      }
+    }
+
+    // if we have a package to bundle, let's run the `before_bundle_command`.
+    if package_types.as_ref().map_or(true, |p| !p.is_empty()) {
+      if let Some(before_bundle) = config_.build.before_bundle_command.clone() {
+        run_hook(
+          "beforeBundleCommand",
+          before_bundle,
+          &interface,
+          options.debug,
+        )?;
       }
     }
 
@@ -274,26 +169,206 @@ pub fn command(mut options: Options) -> Result<()> {
 
     let bundles = bundle_project(settings).with_context(|| "failed to bundle project")?;
 
-    // If updater is active
-    if config_.tauri.updater.active {
-      // make sure we have our package builts
-      let mut signed_paths = Vec::new();
-      for elem in bundles
-        .iter()
-        .filter(|bundle| bundle.package_type == PackageType::Updater)
+    let updater_bundles: Vec<&Bundle> = bundles
+      .iter()
+      .filter(|bundle| bundle.package_type == PackageType::Updater)
+      .collect();
+    // If updater is active and we bundled it
+    if config_.tauri.updater.active && !updater_bundles.is_empty() {
+      // if no password provided we use an empty string
+      let password = var_os("TAURI_KEY_PASSWORD").map(|v| v.to_str().unwrap().to_string());
+      // get the private key
+      let secret_key = if let Some(mut private_key) =
+        var_os("TAURI_PRIVATE_KEY").map(|v| v.to_str().unwrap().to_string())
       {
+        // check if env var points to a file..
+        let pk_dir = Path::new(&private_key);
+        // Check if user provided a path or a key
+        // We validate if the path exist or not.
+        if pk_dir.exists() {
+          // read file content and use it as private key
+          private_key = read_key_from_file(pk_dir)?;
+        }
+        updater_secret_key(private_key, password)
+      } else {
+        Err(anyhow::anyhow!("A public key has been found, but no private key. Make sure to set `TAURI_PRIVATE_KEY` environment variable."))
+      }?;
+
+      let pubkey = base64::decode(&config_.tauri.updater.pubkey)?;
+      let pub_key_decoded = String::from_utf8_lossy(&pubkey);
+      let public_key = minisign::PublicKeyBox::from_string(&pub_key_decoded)?.into_public_key()?;
+
+      // make sure we have our package built
+      let mut signed_paths = Vec::new();
+      for elem in updater_bundles {
         // we expect to have only one path in the vec but we iter if we add
         // another type of updater package who require multiple file signature
         for path in elem.bundle_paths.iter() {
           // sign our path from environment variables
-          let (signature_path, _signature) = sign_file_from_env_variables(path)?;
+          let (signature_path, signature) = sign_file(&secret_key, path)?;
+          if signature.keynum() != public_key.keynum() {
+            return Err(anyhow::anyhow!(
+              "The updater secret key from `TAURI_PRIVATE_KEY` does not match the public key defined in `tauri.conf.json > tauri > updater > pubkey`."
+            ));
+          }
           signed_paths.append(&mut vec![signature_path]);
         }
       }
 
-      if !signed_paths.is_empty() {
-        print_signed_updater_archive(&signed_paths)?;
+      print_signed_updater_archive(&signed_paths)?;
+    }
+  }
+
+  Ok(())
+}
+
+pub fn setup(options: &mut Options) -> Result<AppInterface> {
+  let (merge_config, merge_config_path) = if let Some(config) = &options.config {
+    if config.starts_with('{') {
+      (Some(config.to_string()), None)
+    } else {
+      (
+        Some(
+          std::fs::read_to_string(&config)
+            .with_context(|| "failed to read custom configuration")?,
+        ),
+        Some(config.clone()),
+      )
+    }
+  } else {
+    (None, None)
+  };
+  options.config = merge_config;
+
+  let tauri_path = tauri_dir();
+  set_current_dir(&tauri_path).with_context(|| "failed to change current working directory")?;
+
+  let config = get_config(options.config.as_deref())?;
+
+  let config_guard = config.lock().unwrap();
+  let config_ = config_guard.as_ref().unwrap();
+
+  let interface = AppInterface::new(config_, options.target.clone())?;
+
+  let bundle_identifier_source = match config_.find_bundle_identifier_overwriter() {
+    Some(source) if source == MERGE_CONFIG_EXTENSION_NAME => merge_config_path.unwrap_or(source),
+    Some(source) => source,
+    None => "tauri.conf.json".into(),
+  };
+
+  if config_.tauri.bundle.identifier == "com.tauri.dev" {
+    error!(
+      "You must change the bundle identifier in `{} > tauri > bundle > identifier`. The default value `com.tauri.dev` is not allowed as it must be unique across applications.",
+      bundle_identifier_source
+    );
+    std::process::exit(1);
+  }
+
+  if config_
+    .tauri
+    .bundle
+    .identifier
+    .chars()
+    .any(|ch| !(ch.is_alphanumeric() || ch == '-' || ch == '.'))
+  {
+    error!(
+      "The bundle identifier \"{}\" set in `{} > tauri > bundle > identifier`. The bundle identifier string must contain only alphanumeric characters (A–Z, a–z, and 0–9), hyphens (-), and periods (.).",
+      config_.tauri.bundle.identifier,
+      bundle_identifier_source
+    );
+    std::process::exit(1);
+  }
+
+  if let Some(before_build) = config_.build.before_build_command.clone() {
+    run_hook(
+      "beforeBuildCommand",
+      before_build,
+      &interface,
+      options.debug,
+    )?;
+  }
+
+  if let AppUrl::Url(WindowUrl::App(web_asset_path)) = &config_.build.dist_dir {
+    if !web_asset_path.exists() {
+      return Err(anyhow::anyhow!(
+          "Unable to find your web assets, did you forget to build your web app? Your distDir is set to \"{:?}\".",
+          web_asset_path
+        ));
+    }
+    if web_asset_path.canonicalize()?.file_name() == Some(std::ffi::OsStr::new("src-tauri")) {
+      return Err(anyhow::anyhow!(
+            "The configured distDir is the `src-tauri` folder.
+            Please isolate your web assets on a separate folder and update `tauri.conf.json > build > distDir`.",
+          ));
+    }
+
+    let mut out_folders = Vec::new();
+    for folder in &["node_modules", "src-tauri", "target"] {
+      if web_asset_path.join(folder).is_dir() {
+        out_folders.push(folder.to_string());
       }
+    }
+    if !out_folders.is_empty() {
+      return Err(anyhow::anyhow!(
+            "The configured distDir includes the `{:?}` {}. Please isolate your web assets on a separate folder and update `tauri.conf.json > build > distDir`.",
+            out_folders,
+            if out_folders.len() == 1 { "folder" }else { "folders" }
+          )
+        );
+    }
+  }
+
+  if options.runner.is_none() {
+    options.runner = config_.build.runner.clone();
+  }
+
+  if let Some(list) = options.features.as_mut() {
+    list.extend(config_.build.features.clone().unwrap_or_default());
+  }
+
+  Ok(interface)
+}
+
+fn run_hook(name: &str, hook: HookCommand, interface: &AppInterface, debug: bool) -> Result<()> {
+  let (script, script_cwd) = match hook {
+    HookCommand::Script(s) if s.is_empty() => (None, None),
+    HookCommand::Script(s) => (Some(s), None),
+    HookCommand::ScriptWithOptions { script, cwd } => (Some(script), cwd.map(Into::into)),
+  };
+  let cwd = script_cwd.unwrap_or_else(|| app_dir().clone());
+  if let Some(script) = script {
+    info!(action = "Running"; "{} `{}`", name, script);
+
+    let mut env = command_env(debug);
+    env.extend(interface.env());
+
+    debug!("Setting environment for hook {:?}", env);
+
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd")
+      .arg("/S")
+      .arg("/C")
+      .arg(&script)
+      .current_dir(cwd)
+      .envs(env)
+      .piped()
+      .with_context(|| format!("failed to run `{}` with `cmd /C`", script))?;
+    #[cfg(not(target_os = "windows"))]
+    let status = Command::new("sh")
+      .arg("-c")
+      .arg(&script)
+      .current_dir(cwd)
+      .envs(env)
+      .piped()
+      .with_context(|| format!("failed to run `{}` with `sh -c`", script))?;
+
+    if !status.success() {
+      bail!(
+        "{} `{}` failed with exit code {}",
+        name,
+        script,
+        status.code().unwrap_or_default()
+      );
     }
   }
 

@@ -1,4 +1,4 @@
-// Copyright 2019-2021 Tauri Programme within The Commons Conservancy
+// Copyright 2019-2022 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
@@ -68,6 +68,9 @@ const WINDOW_FOCUS_EVENT: &str = "tauri://focus";
 const WINDOW_BLUR_EVENT: &str = "tauri://blur";
 const WINDOW_SCALE_FACTOR_CHANGED_EVENT: &str = "tauri://scale-change";
 const WINDOW_THEME_CHANGED: &str = "tauri://theme-changed";
+const WINDOW_FILE_DROP_EVENT: &str = "tauri://file-drop";
+const WINDOW_FILE_DROP_HOVER_EVENT: &str = "tauri://file-drop-hover";
+const WINDOW_FILE_DROP_CANCELLED_EVENT: &str = "tauri://file-drop-cancelled";
 const MENU_EVENT: &str = "tauri://menu";
 
 #[derive(Default)]
@@ -142,11 +145,6 @@ fn set_csp<R: Runtime>(
   Csp::DirectiveMap(csp).to_string()
 }
 
-#[cfg(target_os = "linux")]
-fn set_html_csp(html: &str, csp: &str) -> String {
-  html.replacen(tauri_utils::html::CSP_TOKEN, csp, 1)
-}
-
 // inspired by https://github.com/rust-lang/rust/blob/1be5c8f90912c446ecbdc405cbc4a89f9acd20fd/library/alloc/src/str.rs#L260-L297
 fn replace_with_callback<F: FnMut() -> String>(
   original: &str,
@@ -196,6 +194,8 @@ fn replace_csp_nonce(
 #[default_runtime(crate::Wry, wry)]
 pub struct InnerWindowManager<R: Runtime> {
   windows: Mutex<HashMap<String, Window<R>>>,
+  #[cfg(all(desktop, feature = "system-tray"))]
+  pub(crate) trays: Mutex<HashMap<String, crate::SystemTrayHandle<R>>>,
   pub(crate) plugins: Mutex<PluginStore<R>>,
   listeners: Listeners,
   pub(crate) state: Arc<StateManager>,
@@ -210,9 +210,10 @@ pub struct InnerWindowManager<R: Runtime> {
   assets: Arc<dyn Assets>,
   pub(crate) default_window_icon: Option<Icon>,
   pub(crate) app_icon: Option<Vec<u8>>,
+  pub(crate) tray_icon: Option<Icon>,
 
   package_info: PackageInfo,
-  /// The webview protocols protocols available to all windows.
+  /// The webview protocols available to all windows.
   uri_scheme_protocols: HashMap<String, Arc<CustomProtocol<R>>>,
   /// The menu set to all windows.
   menu: Option<Menu>,
@@ -236,6 +237,7 @@ impl<R: Runtime> fmt::Debug for InnerWindowManager<R> {
       .field("config", &self.config)
       .field("default_window_icon", &self.default_window_icon)
       .field("app_icon", &self.app_icon)
+      .field("tray_icon", &self.tray_icon)
       .field("package_info", &self.package_info)
       .field("menu", &self.menu)
       .field("pattern", &self.pattern)
@@ -300,6 +302,8 @@ impl<R: Runtime> WindowManager<R> {
     Self {
       inner: Arc::new(InnerWindowManager {
         windows: Mutex::default(),
+        #[cfg(all(desktop, feature = "system-tray"))]
+        trays: Default::default(),
         plugins: Mutex::new(plugins),
         listeners: Listeners::default(),
         state: Arc::new(state),
@@ -309,6 +313,7 @@ impl<R: Runtime> WindowManager<R> {
         assets: context.assets,
         default_window_icon: context.default_window_icon,
         app_icon: context.app_icon,
+        tray_icon: context.system_tray_icon,
         package_info: context.package_info,
         pattern: context.pattern,
         uri_scheme_protocols,
@@ -367,7 +372,13 @@ impl<R: Runtime> WindowManager<R> {
   /// Get the origin as it will be seen in the webview.
   fn get_browser_origin(&self) -> String {
     match self.base_path() {
-      AppUrl::Url(WindowUrl::External(url)) => url.origin().ascii_serialization(),
+      AppUrl::Url(WindowUrl::External(url)) => {
+        if cfg!(dev) && !cfg!(target_os = "linux") {
+          format_real_schema("tauri")
+        } else {
+          url.origin().ascii_serialization()
+        }
+      }
       _ => format_real_schema("tauri"),
     }
   }
@@ -497,19 +508,17 @@ impl<R: Runtime> WindowManager<R> {
       use crate::api::file::SafePathBuf;
       use tokio::io::{AsyncReadExt, AsyncSeekExt};
       use url::Position;
-      let asset_scope = self.state().get::<crate::Scopes>().asset_protocol.clone();
+      let state = self.state();
+      let asset_scope = state.get::<crate::Scopes>().asset_protocol.clone();
+      let mime_type_cache = MimeTypeCache::default();
       pending.register_uri_scheme_protocol("asset", move |request| {
         let parsed_path = Url::parse(request.uri())?;
         let filtered_path = &parsed_path[..Position::AfterPath];
-        #[cfg(target_os = "windows")]
         let path = filtered_path
           .strip_prefix("asset://localhost/")
           // the `strip_prefix` only returns None when a request is made to `https://tauri.$P` on Windows
           // where `$P` is not `localhost/*`
           .unwrap_or("");
-        // safe to unwrap: request.uri() always starts with this prefix
-        #[cfg(not(target_os = "windows"))]
-        let path = filtered_path.strip_prefix("asset://").unwrap();
         let path = percent_encoding::percent_decode(path.as_bytes())
           .decode_utf8_lossy()
           .to_string();
@@ -616,7 +625,7 @@ impl<R: Runtime> WindowManager<R> {
             response = response.header(k, v);
           }
 
-          let mime_type = MimeType::parse(&data, &path);
+          let mime_type = mime_type_cache.get_or_insert(&data, &path);
           response.mimetype(&mime_type).status(status_code).body(data)
         } else {
           match crate::async_runtime::safe_block_on(async move { tokio::fs::read(path_).await }) {
@@ -813,8 +822,12 @@ impl<R: Runtime> WindowManager<R> {
     >,
   ) -> Box<dyn Fn(&HttpRequest) -> Result<HttpResponse, Box<dyn std::error::Error>> + Send + Sync>
   {
+    #[cfg(dev)]
+    let url = self.get_url().into_owned();
+    #[cfg(not(dev))]
     let manager = self.clone();
     let window_origin = window_origin.to_string();
+
     Box::new(move |request| {
       let path = request
         .uri()
@@ -827,32 +840,53 @@ impl<R: Runtime> WindowManager<R> {
         // the `strip_prefix` only returns None when a request is made to `https://tauri.$P` on Windows
         // where `$P` is not `localhost/*`
         .unwrap_or_else(|| "".to_string());
-      let asset = manager.get_asset(path)?;
-      let mut builder = HttpResponseBuilder::new()
-        .header("Access-Control-Allow-Origin", &window_origin)
-        .mimetype(&asset.mime_type);
-      if let Some(csp) = &asset.csp_header {
-        builder = builder.header("Content-Security-Policy", csp);
-      }
-      let mut response = builder.body(asset.bytes)?;
-      if let Some(handler) = &web_resource_request_handler {
-        handler(request, &mut response);
 
-        // if it's an HTML file, we need to set the CSP meta tag on Linux
-        #[cfg(target_os = "linux")]
-        if let Some(response_csp) = response.headers().get("Content-Security-Policy") {
-          let response_csp = String::from_utf8_lossy(response_csp.as_bytes());
-          let body = set_html_csp(&String::from_utf8_lossy(response.body()), &response_csp);
-          *response.body_mut() = body.as_bytes().to_vec();
-        }
-      } else {
-        #[cfg(target_os = "linux")]
+      let mut builder =
+        HttpResponseBuilder::new().header("Access-Control-Allow-Origin", &window_origin);
+
+      #[cfg(dev)]
+      let mut response = {
+        let mut url = url.clone();
+        url.set_path(&path);
+        match attohttpc::get(url.as_str())
+          .danger_accept_invalid_certs(true)
+          .send()
         {
-          if let Some(csp) = &asset.csp_header {
-            let body = set_html_csp(&String::from_utf8_lossy(response.body()), csp);
-            *response.body_mut() = body.as_bytes().to_vec();
+          Ok(r) => {
+            for (name, value) in r.headers() {
+              if name == "Content-Type" {
+                builder = builder.mimetype(value.to_str().unwrap());
+              }
+              builder = builder.header(name, value);
+            }
+            builder.status(r.status()).body(r.bytes()?)?
+          }
+          Err(e) => {
+            debug_eprintln!("Failed to request {}: {}", url.as_str(), e);
+            return Err(Box::new(e));
           }
         }
+      };
+
+      #[cfg(not(dev))]
+      let mut response = {
+        let asset = manager.get_asset(path)?;
+        builder = builder.mimetype(&asset.mime_type);
+        if let Some(csp) = &asset.csp_header {
+          builder = builder.header("Content-Security-Policy", csp);
+        }
+        builder.body(asset.bytes)?
+      };
+      if let Some(handler) = &web_resource_request_handler {
+        handler(request, &mut response);
+      }
+      // if it's an HTML file, we need to set the CSP meta tag on Linux
+      #[cfg(all(not(dev), target_os = "linux"))]
+      if let Some(response_csp) = response.headers().get("Content-Security-Policy") {
+        let response_csp = String::from_utf8_lossy(response_csp.as_bytes());
+        let html = String::from_utf8_lossy(response.body());
+        let body = html.replacen(tauri_utils::html::CSP_TOKEN, &response_csp, 1);
+        *response.body_mut() = body.as_bytes().to_vec();
       }
       Ok(response)
     })
@@ -881,6 +915,10 @@ impl<R: Runtime> WindowManager<R> {
       #[raw]
       core_script: &'a str,
       #[raw]
+      window_dialogs_script: &'a str,
+      #[raw]
+      window_print_script: &'a str,
+      #[raw]
       event_initialization_script: &'a str,
       #[raw]
       plugin_initialization_script: &'a str,
@@ -891,7 +929,7 @@ impl<R: Runtime> WindowManager<R> {
     }
 
     let bundle_script = if with_global_tauri {
-      include_str!("../scripts/bundle.js")
+      include_str!("../scripts/bundle.global.js")
     } else {
       ""
     };
@@ -946,6 +984,19 @@ impl<R: Runtime> WindowManager<R> {
         )
       ),
       core_script: include_str!("../scripts/core.js"),
+
+      // window.print works on Linux/Windows; need to use the API on macOS
+      #[cfg(any(target_os = "macos", target_os = "ios"))]
+      window_print_script: include_str!("../scripts/window_print.js"),
+      #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+      window_print_script: "",
+
+      // dialogs are implemented natively on Android
+      #[cfg(not(target_os = "android"))]
+      window_dialogs_script: include_str!("../scripts/window_dialogs.js"),
+      #[cfg(target_os = "android")]
+      window_dialogs_script: "",
+
       event_initialization_script: &self.event_initialization_script(),
       plugin_initialization_script,
       freeze_prototype,
@@ -1054,7 +1105,10 @@ impl<R: Runtime> WindowManager<R> {
     #[allow(unused_mut)] // mut url only for the data-url parsing
     let (is_local, mut url) = match &pending.webview_attributes.url {
       WindowUrl::App(path) => {
+        #[cfg(target_os = "linux")]
         let url = self.get_url();
+        #[cfg(not(target_os = "linux"))]
+        let url: Cow<'_, Url> = Cow::Owned(Url::parse("tauri://localhost").unwrap());
         (
           true,
           // ignore "index.html" just to simplify the url
@@ -1071,7 +1125,13 @@ impl<R: Runtime> WindowManager<R> {
       }
       WindowUrl::External(url) => {
         let config_url = self.get_url();
-        (config_url.make_relative(url).is_some(), url.clone())
+        let is_local = config_url.make_relative(url).is_some();
+        let mut url = url.clone();
+        if is_local && !cfg!(target_os = "linux") {
+          url.set_scheme("tauri").unwrap();
+          url.set_host(Some("localhost")).unwrap();
+        }
+        (is_local, url)
       }
       _ => unimplemented!(),
     };
@@ -1289,6 +1349,33 @@ impl<R: Runtime> WindowManager<R> {
   }
 }
 
+/// Tray APIs
+#[cfg(all(desktop, feature = "system-tray"))]
+impl<R: Runtime> WindowManager<R> {
+  pub fn get_tray(&self, id: &str) -> Option<crate::SystemTrayHandle<R>> {
+    self.inner.trays.lock().unwrap().get(id).cloned()
+  }
+
+  pub fn trays(&self) -> HashMap<String, crate::SystemTrayHandle<R>> {
+    self.inner.trays.lock().unwrap().clone()
+  }
+
+  pub fn attach_tray(&self, id: String, tray: crate::SystemTrayHandle<R>) {
+    self.inner.trays.lock().unwrap().insert(id, tray);
+  }
+
+  pub fn get_tray_by_runtime_id(&self, id: u16) -> Option<(String, crate::SystemTrayHandle<R>)> {
+    let trays = self.inner.trays.lock().unwrap();
+    let iter = trays.iter();
+    for (tray_id, tray) in iter {
+      if tray.id == id {
+        return Some((tray_id.clone(), tray.clone()));
+      }
+    }
+    None
+  }
+}
+
 fn on_window_event<R: Runtime>(
   window: &Window<R>,
   manager: &WindowManager<R>,
@@ -1335,7 +1422,7 @@ fn on_window_event<R: Runtime>(
       },
     )?,
     WindowEvent::FileDrop(event) => match event {
-      FileDropEvent::Hovered(paths) => window.emit("tauri://file-drop-hover", paths)?,
+      FileDropEvent::Hovered(paths) => window.emit(WINDOW_FILE_DROP_HOVER_EVENT, paths)?,
       FileDropEvent::Dropped(paths) => {
         let scopes = window.state::<Scopes>();
         for path in paths {
@@ -1345,9 +1432,9 @@ fn on_window_event<R: Runtime>(
             let _ = scopes.allow_directory(path, false);
           }
         }
-        window.emit("tauri://file-drop", paths)?
+        window.emit(WINDOW_FILE_DROP_EVENT, paths)?
       }
-      FileDropEvent::Cancelled => window.emit("tauri://file-drop-cancelled", ())?,
+      FileDropEvent::Cancelled => window.emit(WINDOW_FILE_DROP_CANCELLED_EVENT, ())?,
       _ => unimplemented!(),
     },
     WindowEvent::ThemeChanged(theme) => window.emit(WINDOW_THEME_CHANGED, theme.to_string())?,
@@ -1391,6 +1478,26 @@ fn request_to_path(request: &tauri_runtime::http::Request, base_url: &str) -> St
   } else {
     // skip leading `/`
     path.chars().skip(1).collect()
+  }
+}
+
+// key is uri/path, value is the store mime type
+#[cfg(protocol_asset)]
+#[derive(Debug, Clone, Default)]
+struct MimeTypeCache(Arc<Mutex<HashMap<String, String>>>);
+
+#[cfg(protocol_asset)]
+impl MimeTypeCache {
+  pub fn get_or_insert(&self, content: &[u8], uri: &str) -> String {
+    let mut cache = self.0.lock().unwrap();
+    let uri = uri.to_string();
+    if let Some(mime_type) = cache.get(&uri) {
+      mime_type.clone()
+    } else {
+      let mime_type = MimeType::parse(content, &uri);
+      cache.insert(uri, mime_type.clone());
+      mime_type
+    }
   }
 }
 
