@@ -91,7 +91,7 @@ SetCompressor /SOLID lzma
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION "CreateDesktopShortcut"
 
 ; Show run app after installation.
-!define MUI_FINISHPAGE_RUN $INSTDIR\${MAINBINARYNAME}.exe
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${MAINBINARYNAME}.exe"
 
 ;--------------------------------
 ; Installer pages
@@ -251,6 +251,25 @@ Section Install
     File /a /oname={{this}} {{@key}}
   {{/each}}
 
+  ; Setup deep-link protocols
+  !if "${INSTALLMODE}" == "perMachine"
+  {{#each deep_link_protocols}}
+    WriteRegStr HKCR "{{this}}" "" "URL:{{this}}"
+    WriteRegStr HKCR "{{this}}" "URL Protocol" ""
+    WriteRegStr HKCR "{{this}}\DefaultIcon" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\""
+    WriteRegStr HKCR "{{this}}\shell\open\command" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
+
+  {{/each}}
+  !else
+  {{#each deep_link_protocols}}
+    WriteRegStr HKCU "Software\Classes\\{{this}}" "" "URL:{{this}}"
+    WriteRegStr HKCU "Software\Classes\\{{this}}" "URL Protocol" ""
+    WriteRegStr HKCU "Software\Classes\\{{this}}\DefaultIcon" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\""
+    WriteRegStr HKCU "Software\Classes\\{{this}}\shell\open\command" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
+
+  {{/each}}
+  !endif
+
   ; Create uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -259,7 +278,7 @@ Section Install
 
   ; Registry information for add/remove programs
   WriteRegStr SHCTX "${APR}" "DisplayName" "${PRODUCTNAME}"
-  WriteRegStr SHCTX "${APR}" "DisplayIcon" "$\"$INSTDIR\Resources.exe$\""
+  WriteRegStr SHCTX "${APR}" "DisplayIcon" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\""
   WriteRegStr SHCTX "${APR}" "DisplayVersion" "$\"${VERSION}$\""
   WriteRegStr SHCTX "${APR}" "Publisher" "${MANUFACTURER}"
   WriteRegStr SHCTX "${APR}" "InstallLocation" "$\"$INSTDIR$\""

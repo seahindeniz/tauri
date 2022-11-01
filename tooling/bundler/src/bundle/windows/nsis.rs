@@ -220,6 +220,11 @@ fn build_nsis_app_installer(
   let binaries = generate_binaries_data(settings)?;
   data.insert("binaries", to_json(binaries));
 
+  data.insert(
+    "deep_link_protocols",
+    to_json(settings.deep_link_protocols()),
+  );
+
   let silent_webview2_install = if let WebviewInstallMode::DownloadBootstrapper { silent }
   | WebviewInstallMode::EmbedBootstrapper { silent }
   | WebviewInstallMode::OfflineInstaller { silent } =
